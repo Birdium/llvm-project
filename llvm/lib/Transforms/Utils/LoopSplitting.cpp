@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Utils/LoopSplitting.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
@@ -10,12 +11,11 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Pass.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 
 using namespace llvm;
 
-static SmallPtrSet<Value *, 16> getBdchkInsts(Function *F) {
-  SmallPtrSet<BasicBlock *, 16> PanicBBs;
-  SmallPtrSet<Value *, 16> BdchkInsts;
+void LoopSplittingPass::initialization(Function *F) {
   for (auto &BB : *F) {
     for (auto &I : BB) {
       // dbgs() << "Instruction: " << I << "\n";
@@ -23,7 +23,7 @@ static SmallPtrSet<Value *, 16> getBdchkInsts(Function *F) {
         if (auto cf = LI->getCalledFunction()) {
           if (auto name = cf->getName(); name.contains("panic_bounds_check")) {
             // dbgs() << "panic BB: " << BB << "\n";
-            PanicBBs.insert(&BB);
+            panicBBs.insert(&BB);
           }
         }
       }
@@ -31,29 +31,60 @@ static SmallPtrSet<Value *, 16> getBdchkInsts(Function *F) {
         if (auto cf = LI->getCalledFunction()) {
           if (auto name = cf->getName(); name.contains("panic_bounds_check")) {
             // dbgs() << "panic BB: " << BB << "\n";
-            PanicBBs.insert(&BB);
+            panicBBs.insert(&BB);
           }
         }
       }
     }
   }
-  for (auto *BB : PanicBBs) {
+  for (auto *BB : panicBBs) {
     // dbgs() << "panic BB: " << BB->getName() << "\n";
     for (auto *PredBB : predecessors(BB)) {
       if (auto *TI = PredBB->getTerminator()) {
         // PanicInsts.insert(TI);
         if (auto *BI = dyn_cast<BranchInst>(TI)) {
           if (BI->isConditional()) {
-            BdchkInsts.insert(BI->getCondition());
+            auto CI = dyn_cast<CmpInst>(BI->getCondition());
+            // if
+            // (BI->getSuccessor(0)->getName().contains("panic_bounds_check")) {
+            //   BI->swapSuccessors();
+            //   CI->setPredicate(CI->getInversePredicate());
+            // }
+            // if (CI->getPredicate() == CmpInst::ICMP_SGT ||
+            //     CI->getPredicate() == CmpInst::ICMP_UGT ||
+            //     CI->getPredicate() == CmpInst::ICMP_SGE ||
+            //     CI->getPredicate() == CmpInst::ICMP_UGE) {
+            //   CI->swapOperands();
+            // }
+
+            panicBranchInsts.insert(BI);
+            bdchkInsts.insert(CI);
+            if (BI->getSuccessor(0)->getName().contains("panic_bounds_check")) {
+              bdchkInstsInv.insert(CI);
+            }
           }
         }
       }
     }
   }
-  for (auto *I : BdchkInsts) {
-    dbgs() << "bdchk inst: " << *I << "\n";
+}
+
+static SmallPtrSet<BranchInst *, 16>
+findPanicBranchInstsInLoop(Loop *L,
+                           SmallPtrSet<BranchInst *, 16> &PanicBranchInsts) {
+  SmallPtrSet<BranchInst *, 16> panics;
+  for (auto *BB : L->getBlocks()) {
+    for (auto &I : *BB) {
+      if (auto *BI = dyn_cast<BranchInst>(&I)) {
+        if (BI->isConditional()) {
+          if (PanicBranchInsts.count(BI)) {
+            panics.insert(BI);
+          }
+        }
+      }
+    }
   }
-  return BdchkInsts;
+  return panics;
 }
 
 static SmallPtrSet<Value *, 16>
@@ -73,13 +104,14 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
                                          FunctionAnalysisManager &AM) {
   LoopInfo *LI = &AM.getResult<LoopAnalysis>(F);
   DominatorTree *DT = &AM.getResult<DominatorTreeAnalysis>(F);
+  auto *LAIs = &AM.getResult<LoopAccessAnalysis>(F);
   ScalarEvolution *SE = &AM.getResult<ScalarEvolutionAnalysis>(F);
-  AssumptionCache *AC = &AM.getResult<AssumptionAnalysis>(F);
-  auto *MSSAAnalysis = AM.getCachedResult<MemorySSAAnalysis>(F);
   // dbgs() << "LI, DT, SE, AC, MSSAAnalysis: " << LI << ", " << DT << ", " <<
   // SE << ", " << AC << ", " << MSSAAnalysis << "\n";
   dbgs() << "========================================\n";
   dbgs() << "Function: " << F.getName() << "\n";
+
+  initialization(&F);
 
   // dbgs() << "panic insts count: " << PanicInsts.size() << "\n";
   // for (auto *I : PanicInsts) {
@@ -89,8 +121,7 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
   // for (auto *I : BdchkInsts) {
   //  dbgs() << "bdchk inst: " << *I << "\n";
   // }
-
-  auto BdchkInsts = getBdchkInsts(&F);
+  bool changed = false;
 
   for (auto *L : LI->getLoopsInPreorder()) {
     dbgs() << "----------------------------------------\n";
@@ -98,7 +129,8 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
     if (!L->isInnermost()) {
       // continue;
     }
-    auto bdchks = findBdchkInstsInLoop(L, BdchkInsts);
+    auto bdchks = findBdchkInstsInLoop(L, bdchkInsts);
+    auto panicbranches = findPanicBranchInstsInLoop(L, panicBranchInsts);
     // TODO: Check if the loop contains memory access instructions.
     auto btc = SE->getBackedgeTakenCount(L);
 
@@ -106,55 +138,204 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
     if (PHINode *PN = dyn_cast<PHINode>(&Header->front())) {
       if (SE->isSCEVable(PN->getType())) {
         const SCEV *S = SE->getSCEV(PN);
-        //if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S)) {
-          //if (AR->getLoop() == L && AR->isAffine()) {
-            // PN is an induction variable.
-            dbgs() << "SCEV: " << *S << "\n";
-            dbgs() << "Backedge taken count: " << *btc << "\n";
-            dbgs() << "Induction variable: " << *PN << "\n";
-            SmallVector<BasicBlock *, 4> ExitingBlocks;
-            L->getExitingBlocks(ExitingBlocks);
-            dbgs() << "Exiting blocks count: " << ExitingBlocks.size() << "\n";
-            for (auto *ExitingBlock : ExitingBlocks) {
-              dbgs() << "Exiting block: " << ExitingBlock->getName() << "\n";
+        // if (const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(S)) {
+        // if (AR->getLoop() == L && AR->isAffine()) {
+        // PN is an induction variable.
+        dbgs() << "SCEV: " << *S << "\n";
+        dbgs() << "Backedge taken count: " << *btc << "\n";
+        dbgs() << "Backedge max taken count: "
+               << *SE->getSymbolicMaxBackedgeTakenCount(L) << "\n";
+        dbgs() << "Induction variable: " << *PN << "\n";
+        SmallVector<BasicBlock *, 4> ExitingBlocks;
+        L->getExitingBlocks(ExitingBlocks);
+        dbgs() << "Exiting blocks count: " << ExitingBlocks.size() << "\n";
+        for (auto *ExitingBlock : ExitingBlocks) {
+          dbgs() << "Exiting block: " << ExitingBlock->getName() << "\n";
+        }
+        dbgs() << "bdchk insts count: " << bdchks.size() << "\n";
+        for (auto *I : bdchks) {
+          dbgs() << "bdchk inst: " << *I << "\n";
+        }
+
+        auto loopMaxTripCount = SE->getSymbolicMaxBackedgeTakenCount(L);
+
+        if (auto *UMinExpr = dyn_cast<SCEVUMinExpr>(loopMaxTripCount)) {
+          auto *LHS = UMinExpr->getOperand(0);
+          auto *RHS = UMinExpr->getOperand(1);
+          auto *LHSSimplified = SE->getSCEVAtScope(LHS, L);
+          auto *RHSSimplified = SE->getSCEVAtScope(RHS, L);
+          if (!SE->hasComputableLoopEvolution(LHSSimplified, L)) {
+            // LHS does not contain a recursive subexpression, replace
+            // UMinExpr with LHS
+            loopMaxTripCount = LHSSimplified;
+          } else if (!SE->hasComputableLoopEvolution(RHSSimplified, L)) {
+            // RHS does not contain a recursive subexpression, replace
+            // UMinExpr with RHS
+            loopMaxTripCount = RHSSimplified;
+          }
+        }
+
+        dbgs() << "Loop max trip count: " << *loopMaxTripCount << "\n";
+
+        bool doSplit = bdchks.size() > 0;
+
+        SmallPtrSet<Value *, 16> arrlens;
+        SmallDenseMap<Value *, SmallPtrSet<CmpInst *, 16>> arrlen2CI;
+
+        for (auto *I : bdchks) {
+          if (auto *CI = dyn_cast<CmpInst>(I)) {
+            if (CI->getOperand(0) == PN) {
+              dbgs() << CI->getPredicate() << "\n";
+              if (CI->getPredicate() != CmpInst::ICMP_NE) {
+                auto *arrlen = CI->getOperand(1);
+                arrlens.insert(arrlen);
+                arrlen2CI[arrlen].insert(CI);
+              }
+            } else if (CI->getOperand(1) == PN) {
+              dbgs() << CI->getPredicate() << "\n";
+              if (CI->getPredicate() != CmpInst::ICMP_NE) {
+                auto *arrlen = CI->getOperand(0);
+                arrlens.insert(arrlen);
+                arrlen2CI[arrlen].insert(CI);
+              }
+            } else {
+              doSplit = false;
+              break;
             }
-            dbgs() << "bdchk insts count: " << bdchks.size() << "\n";
-            for (auto *I : bdchks) {
-              dbgs() << "bdchk inst: " << *I << "\n";
+          }
+        }
+        if (doSplit) {
+          bool doEliminate = arrlens.size() > 0;
+          dbgs() << "Splitting: " << doSplit << "\n";
+          dbgs() << "Array lengths count: " << arrlens.size() << "\n";
+          for (auto &[arrlen, CIs] : arrlen2CI) {
+            auto *arrlenSCEV = SE->getSCEV(arrlen);
+
+            dbgs() << "Array length: " << *arrlenSCEV << "\n";
+            for (auto CI : CIs) {
+              auto index = CI->getOperand(0) == arrlen ? CI->getOperand(1)
+                                                       : CI->getOperand(0);
+              bool isCITrueWhenEQ = CI->isTrueWhenEqual();
+              if (bdchkInstsInv.count(CI)) {
+                isCITrueWhenEQ = !isCITrueWhenEQ;
+              }
+              auto *indexSCEV = SE->getSCEV(index);
+              dbgs() << "Index: " << *indexSCEV << "\n";
+              const SCEV *diff = SE->getMinusSCEV(arrlenSCEV, loopMaxTripCount);
+              dbgs() << "Difference: " << *diff << "\n";
+              bool isAlwaysInbound =
+                  isCITrueWhenEQ ? isKnownNonNegativeInLoop(diff, L, *SE)
+                                 : isKnownPositiveInLoop(diff, L, *SE);
+              if (!isAlwaysInbound) {
+                dbgs() << "Index may out of bound: " << *CI << "\n";
+                doEliminate = false;
+              } else {
+                dbgs() << "Index always in bound: " << *CI << "\n";
+                for (auto *I : panicbranches) {
+                  if (auto *BI = dyn_cast<BranchInst>(I)) {
+                    if (BI->getCondition() == CI) {
+                      auto succ0 = BI->getSuccessor(0);
+                      auto succ1 = BI->getSuccessor(1);
+                      BasicBlock *target = nullptr;
+                      if (panicBBs.count(succ0)) {
+                        dbgs()
+                            << "Panic branch successor 0: " << succ0->getName()
+                            << "\n";
+                        target = succ1;
+                      } else if (panicBBs.count(succ1)) {
+                        dbgs()
+                            << "Panic branch successor 1: " << succ1->getName()
+                            << "\n";
+                        target = succ0;
+                      }
+                      if (target) {
+                        BranchInst *NewBI = BranchInst::Create(target);
+                        NewBI->insertAfter(I);
+                        I->eraseFromParent();
+                        changed = true;
+                      }
+                    }
+                  }
+                }
+                // auto target = succ0;
+                // if (target) {
+
+                //   BranchInst *NewBI = BranchInst::Create(target);
+                //   NewBI->insertAfter(I);
+                //   I->eraseFromParent();
+                //   // NewBI->insertAfter(bb->getTerminator());
+
+                //   changed = true;
+                // }
+              }
             }
-          //}
-        //}
+          }
+          // if (doEliminate) {
+          //   for (auto *I : panicbranches) {
+          //     dbgs() << "Panic branch: " << *I << "\n";
+          //     auto succ0 = I->getSuccessor(0);
+          //     // auto succ1 = I->getSuccessor(1);
+          //     // BasicBlock *target = nullptr;
+          //     // if (panicBBs.count(succ0)) {
+          //     //   dbgs() << "Panic branch successor 0: " <<
+          //     succ0->getName()
+          //     //          << "\n";
+          //     //   target = succ1;
+          //     // } else if (panicBBs.count(succ1)) {
+          //     //   dbgs() << "Panic branch successor 1: " <<
+          //     succ1->getName()
+          //     //          << "\n";
+          //     //   target = succ0;
+          //     // }
+          //     auto target = succ0;
+          //     if (target) {
+
+          //       BranchInst *NewBI = BranchInst::Create(target);
+          //       NewBI->insertAfter(I);
+          //       I->eraseFromParent();
+          //       // NewBI->insertAfter(bb->getTerminator());
+
+          //       changed = true;
+          //     }
+          //   }
+        }
       }
     }
-
-    // if (IV != nullptr)
-    //   dbgs() << "Canonical induction variable: " << *IV << "\n";
-    // else
-    //   dbgs() << "No canonical induction variable\n";
-    // const SCEV *BackedgeTakenCount =
-    // getAnalysis<ScalarEvolutionWrapperPass>().getSE()->getBackedgeTakenCount(L);
-
-    // TODO: Get the loop's iteration count and the size of the accessed array.
-
-    // Create a new basic block to hold the split loop.
-    // BasicBlock *NewBB = BasicBlock::Create(F.getContext(), "split", &F);
-
-    // Create a condition to check if the iteration count and array size are
-    // less than 100. IRBuilder<> Builder(&F.getEntryBlock().front()); Value
-    // *Cond = Builder.CreateAnd(
-    //   Builder.CreateICmpSLT(IterationCount, Builder.getInt64(100)),
-    //   Builder.CreateICmpSLT(ArraySize, Builder.getInt64(100))
-    // );
-
-    // Split the loop based on the condition.
-    //   SplitBlockAndInsertIfThen(Cond, &F.getEntryBlock().front(), false,
-    //   nullptr, nullptr, NewBB);
-
-    // TODO: Clone the loop and modify the bounds to [0, 100) and [100, m).
-
-    // TODO: Add the cloned loops to the new basic block.
   }
 
+  // if (IV != nullptr)
+  //   dbgs() << "Canonical induction variable: " << *IV << "\n";
+  // else
+  //   dbgs() << "No canonical induction variable\n";
+  // const SCEV *BackedgeTakenCount =
+  // getAnalysis<ScalarEvolutionWrapperPass>().getSE()->getBackedgeTakenCount(L);
+
+  // TODO: Get the loop's iteration count and the size of the accessed array.
+
+  // Create a new basic block to hold the split loop.
+  // BasicBlock *NewBB = BasicBlock::Create(F.getContext(), "split", &F);
+
+  // Create a condition to check if the iteration count and array size are
+  // less than 100. IRBuilder<> Builder(&F.getEntryBlock().front()); Value
+  // *Cond = Builder.CreateAnd(
+  //   Builder.CreateICmpSLT(IterationCount, Builder.getInt64(100)),
+  //   Builder.CreateICmpSLT(ArraySize, Builder.getInt64(100))
+  // );
+
+  // Split the loop based on the condition.
+  //   SplitBlockAndInsertIfThen(Cond, &F.getEntryBlock().front(), false,
+  //   nullptr, nullptr, NewBB);
+
+  // TODO: Clone the loop and modify the bounds to [0, 100) and [100, m).
+
+  // TODO: Add the cloned loops to the new basic block.
+
   dbgs() << "\n";
-  return PreservedAnalyses::all();
+  if (changed) {
+    dbgs() << "Changed\n";
+    return PreservedAnalyses::none();
+  } else {
+    dbgs() << "No change\n";
+    return PreservedAnalyses::all();
+  }
 }

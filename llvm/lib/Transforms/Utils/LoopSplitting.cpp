@@ -12,6 +12,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 using namespace llvm;
 
@@ -100,6 +101,32 @@ findBdchkInstsInLoop(Loop *L, SmallPtrSet<Value *, 16> &BdchkInsts) {
   return bdchks;
 }
 
+static SmallDenseMap<Value *, SmallPtrSet<CmpInst *, 16>>
+getArrlen2CI(PHINode *PN, SmallPtrSet<Value *, 16> &bdchks, bool &doSplit) {
+  SmallDenseMap<Value *, SmallPtrSet<CmpInst *, 16>> arrlen2CI;
+  for (auto *I : bdchks) {
+    if (auto *CI = dyn_cast<CmpInst>(I)) {
+      if (CI->getOperand(0) == PN) {
+        dbgs() << CI->getPredicate() << "\n";
+        if (CI->getPredicate() != CmpInst::ICMP_NE) {
+          auto *arrlen = CI->getOperand(1);
+          arrlen2CI[arrlen].insert(CI);
+        }
+      } else if (CI->getOperand(1) == PN) {
+        dbgs() << CI->getPredicate() << "\n";
+        if (CI->getPredicate() != CmpInst::ICMP_NE) {
+          auto *arrlen = CI->getOperand(0);
+          arrlen2CI[arrlen].insert(CI);
+        }
+      } else {
+        doSplit = false;
+        break;
+      }
+    }
+  }
+  return arrlen2CI;
+}
+
 PreservedAnalyses LoopSplittingPass::run(Function &F,
                                          FunctionAnalysisManager &AM) {
   LoopInfo *LI = &AM.getResult<LoopAnalysis>(F);
@@ -179,35 +206,13 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
 
         bool doSplit = bdchks.size() > 0;
 
-        SmallPtrSet<Value *, 16> arrlens;
-        SmallDenseMap<Value *, SmallPtrSet<CmpInst *, 16>> arrlen2CI;
+        auto arrlen2CI = getArrlen2CI(PN, bdchks, doSplit);
 
-        for (auto *I : bdchks) {
-          if (auto *CI = dyn_cast<CmpInst>(I)) {
-            if (CI->getOperand(0) == PN) {
-              dbgs() << CI->getPredicate() << "\n";
-              if (CI->getPredicate() != CmpInst::ICMP_NE) {
-                auto *arrlen = CI->getOperand(1);
-                arrlens.insert(arrlen);
-                arrlen2CI[arrlen].insert(CI);
-              }
-            } else if (CI->getOperand(1) == PN) {
-              dbgs() << CI->getPredicate() << "\n";
-              if (CI->getPredicate() != CmpInst::ICMP_NE) {
-                auto *arrlen = CI->getOperand(0);
-                arrlens.insert(arrlen);
-                arrlen2CI[arrlen].insert(CI);
-              }
-            } else {
-              doSplit = false;
-              break;
-            }
-          }
-        }
         if (doSplit) {
-          bool doEliminate = arrlens.size() > 0;
+          bool doEliminate = arrlen2CI.size() > 0;
           dbgs() << "Splitting: " << doSplit << "\n";
-          dbgs() << "Array lengths count: " << arrlens.size() << "\n";
+          dbgs() << "Array lengths count: " << arrlen2CI.size() << "\n";
+          SmallPtrSet<CmpInst *, 16> mayOutCmps;
           for (auto &[arrlen, CIs] : arrlen2CI) {
             auto *arrlenSCEV = SE->getSCEV(arrlen);
 
@@ -229,6 +234,7 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
               if (!isAlwaysInbound) {
                 dbgs() << "Index may out of bound: " << *CI << "\n";
                 doEliminate = false;
+                mayOutCmps.insert(CI);
               } else {
                 dbgs() << "Index always in bound: " << *CI << "\n";
                 for (auto *I : panicbranches) {
@@ -236,68 +242,50 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
                     if (BI->getCondition() == CI) {
                       auto succ0 = BI->getSuccessor(0);
                       auto succ1 = BI->getSuccessor(1);
-                      BasicBlock *target = nullptr;
-                      if (panicBBs.count(succ0)) {
-                        dbgs()
-                            << "Panic branch successor 0: " << succ0->getName()
-                            << "\n";
-                        target = succ1;
-                      } else if (panicBBs.count(succ1)) {
-                        dbgs()
-                            << "Panic branch successor 1: " << succ1->getName()
-                            << "\n";
-                        target = succ0;
-                      }
-                      if (target) {
-                        BranchInst *NewBI = BranchInst::Create(target);
-                        NewBI->insertAfter(I);
-                        I->eraseFromParent();
-                        changed = true;
-                      }
+                      BasicBlock *target = panicBBs.count(succ0) ? succ1 : succ0;
+                      BranchInst *NewBI = BranchInst::Create(target);
+                      NewBI->insertAfter(I);
+                      I->eraseFromParent();
+                      LI;
+                      changed = true;
                     }
                   }
                 }
-                // auto target = succ0;
-                // if (target) {
-
-                //   BranchInst *NewBI = BranchInst::Create(target);
-                //   NewBI->insertAfter(I);
-                //   I->eraseFromParent();
-                //   // NewBI->insertAfter(bb->getTerminator());
-
-                //   changed = true;
-                // }
               }
             }
           }
-          // if (doEliminate) {
-          //   for (auto *I : panicbranches) {
-          //     dbgs() << "Panic branch: " << *I << "\n";
-          //     auto succ0 = I->getSuccessor(0);
-          //     // auto succ1 = I->getSuccessor(1);
-          //     // BasicBlock *target = nullptr;
-          //     // if (panicBBs.count(succ0)) {
-          //     //   dbgs() << "Panic branch successor 0: " <<
-          //     succ0->getName()
-          //     //          << "\n";
-          //     //   target = succ1;
-          //     // } else if (panicBBs.count(succ1)) {
-          //     //   dbgs() << "Panic branch successor 1: " <<
-          //     succ1->getName()
-          //     //          << "\n";
-          //     //   target = succ0;
-          //     // }
-          //     auto target = succ0;
-          //     if (target) {
+          if (!mayOutCmps.empty()) {
+            if (!L->isInnermost()) {
+              dbgs() << "Do Promotion\n";
+              llvm::ValueToValueMapTy VMap;
+              llvm::SmallVector<llvm::BasicBlock *, 8> NewLoopBlocks;
+              llvm::Loop *NewLoop = llvm::cloneLoopWithPreheader(L->getLoopPreheader(), L->getExitBlock(), L, VMap, ".clone", LI, DT, NewLoopBlocks);
+              for (auto *BB : NewLoopBlocks) {
+                for (auto &I : *BB) {
+                  if (auto *CI = dyn_cast<CmpInst>(&I)) {
+                    if (mayOutCmps.count(CI)) {
+                      auto succ0 = CI->getParent()->getTerminator()->getSuccessor(0);
+                      auto succ1 = CI->getParent()->getTerminator()->getSuccessor(1);
+                      BasicBlock *target = panicBBs.count(succ0) ? succ1 : succ0;
+                      BranchInst *NewBI = BranchInst::Create(target);
+                      NewBI->insertAfter(CI);
+                      CI->eraseFromParent();
+                    }
+                  }
+                }
+              }
+              for (auto CI : mayOutCmps) {
+                auto op0 = CI->getOperand(0);
+                auto op1 = CI->getOperand(1);
+                auto scev0 = SE->getSCEV(op0);
+                auto scev1 = SE->getSCEV(op1);
+                
+                //CI->eraseFromParent();
+              }
 
-          //       BranchInst *NewBI = BranchInst::Create(target);
-          //       NewBI->insertAfter(I);
-          //       I->eraseFromParent();
-          //       // NewBI->insertAfter(bb->getTerminator());
-
-          //       changed = true;
-          //     }
-          //   }
+              continue;
+            }
+          }
         }
       }
     }

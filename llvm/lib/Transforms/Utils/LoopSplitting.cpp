@@ -11,8 +11,9 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Pass.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 using namespace llvm;
 
@@ -242,7 +243,8 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
                     if (BI->getCondition() == CI) {
                       auto succ0 = BI->getSuccessor(0);
                       auto succ1 = BI->getSuccessor(1);
-                      BasicBlock *target = panicBBs.count(succ0) ? succ1 : succ0;
+                      BasicBlock *target =
+                          panicBBs.count(succ0) ? succ1 : succ0;
                       BranchInst *NewBI = BranchInst::Create(target);
                       NewBI->insertAfter(I);
                       I->eraseFromParent();
@@ -255,35 +257,91 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
             }
           }
           if (!mayOutCmps.empty()) {
-            if (!L->isInnermost()) {
+            if (L->isInnermost()) {
               dbgs() << "Do Promotion\n";
-              llvm::ValueToValueMapTy VMap;
-              llvm::SmallVector<llvm::BasicBlock *, 8> NewLoopBlocks;
-              llvm::Loop *NewLoop = llvm::cloneLoopWithPreheader(L->getLoopPreheader(), L->getExitBlock(), L, VMap, ".clone", LI, DT, NewLoopBlocks);
-              for (auto *BB : NewLoopBlocks) {
-                for (auto &I : *BB) {
-                  if (auto *CI = dyn_cast<CmpInst>(&I)) {
-                    if (mayOutCmps.count(CI)) {
-                      auto succ0 = CI->getParent()->getTerminator()->getSuccessor(0);
-                      auto succ1 = CI->getParent()->getTerminator()->getSuccessor(1);
-                      BasicBlock *target = panicBBs.count(succ0) ? succ1 : succ0;
-                      BranchInst *NewBI = BranchInst::Create(target);
-                      NewBI->insertAfter(CI);
-                      CI->eraseFromParent();
+              ValueToValueMapTy VMap;
+              SmallVector<llvm::BasicBlock *, 8> NewLoopBlocks;
+              if (L->getLoopPreheader()) {
+                auto preheader = L->getLoopPreheader();
+                auto originPreheader =
+                    SplitEdge(preheader, L->getHeader(), DT, LI);
+                llvm::Loop *NewLoop = llvm::cloneLoopWithPreheader(
+                    L->getLoopPreheader(), L->getLoopPreheader(), L, VMap,
+                    ".clone", LI, DT, NewLoopBlocks);
+                remapInstructionsInBlocks(NewLoopBlocks, VMap);
+                auto clonePreheader = NewLoop->getLoopPreheader();
+                SmallDenseMap<BranchInst *, BranchInst *> BranchReplacements;
+                for (auto *BB : NewLoop->getBlocks()) {
+                  for (auto &I : *BB) {
+                    if (auto *BI = dyn_cast<BranchInst>(&I)) {
+                      if (BI->getNumSuccessors() == 2) {
+                        auto succ0 = BI->getSuccessor(0);
+                        auto succ1 = BI->getSuccessor(1);
+                        BasicBlock *target = nullptr;
+                        if (panicBBs.count(succ0)) {
+                          target = succ1;
+                        } else if (panicBBs.count(succ1)) {
+                          target = succ0;
+                        }
+                        if (target != nullptr) {
+                          BranchInst *NewBI = BranchInst::Create(target);
+                          BranchReplacements[BI] = NewBI;
+                        }
+                      }
                     }
                   }
                 }
-              }
-              for (auto CI : mayOutCmps) {
-                auto op0 = CI->getOperand(0);
-                auto op1 = CI->getOperand(1);
-                auto scev0 = SE->getSCEV(op0);
-                auto scev1 = SE->getSCEV(op1);
-                
-                //CI->eraseFromParent();
-              }
+                for (auto &[BI, NewBI] : BranchReplacements) {
+                  NewBI->insertAfter(BI);
+                  BI->eraseFromParent();
+                }
+                dbgs() << "NewLoopBlocks count: " << NewLoopBlocks.size() << "\n";
+                for (auto *BB : NewLoop->getBlocks()) {
+                  dbgs() << "NewLoopBlock: " << *BB << "\n";
+                }
+                SmallVector<Value *, 16> cmpvalues;
+                for (auto CI : mayOutCmps) {
+                  auto op0 = CI->getOperand(0);
+                  auto op1 = CI->getOperand(1);
+                  auto scev0 = SE->getSCEV(op0);
+                  auto scev1 = SE->getSCEV(op1);
+                  dbgs() << "CI: " << *CI << "\n";
+                  dbgs() << "op0: " << *op0 << "\n";
+                  dbgs() << "op1: " << *op1 << "\n";
+                  auto scev_idx = arrlen2CI.count(op0) ? scev1 : scev0;
+                  auto scev_len = arrlen2CI.count(op0) ? scev0 : scev1;
+                  auto scev_idx_max =
+                      SE->getSCEVAtScope(scev_idx, L->getParentLoop());
 
-              continue;
+                  dbgs() << "scev_idx: " << *scev_idx << "\n";
+                  dbgs() << "scev_len: " << *scev_len << "\n";
+                  dbgs() << "scev_idx_max: " << *scev_idx_max << "\n";
+
+                  llvm::SCEVExpander Expander(
+                      *SE, F.getParent()->getDataLayout(), "scevexpander");
+                  auto val_idx = Expander.expandCodeFor(
+                      scev_idx_max, nullptr, preheader->getTerminator());
+                  auto val_len = Expander.expandCodeFor(
+                      scev_len, nullptr, preheader->getTerminator());
+                  auto bdchk = ICmpInst::Create(
+                      Instruction::ICmp, ICmpInst::ICMP_ULT, val_idx, val_len);
+                  bdchk->insertBefore(preheader->getTerminator());
+                  cmpvalues.push_back(bdchk);
+                }
+                Value *branchvalue = nullptr;
+                if (!cmpvalues.empty())
+                  branchvalue = cmpvalues[0];
+                for (int i = 1; i < cmpvalues.size(); i++) {
+                  branchvalue =
+                      BinaryOperator::CreateAnd(branchvalue, cmpvalues[i]);
+                  auto branchinst = dyn_cast<BranchInst>(branchvalue);
+                  branchinst->insertBefore(preheader->getTerminator());
+                }
+                auto *NewBI = BranchInst::Create(originPreheader,
+                                                 clonePreheader, branchvalue);
+                NewBI->insertBefore(preheader->getTerminator());
+                preheader->getTerminator()->eraseFromParent();
+              }
             }
           }
         }

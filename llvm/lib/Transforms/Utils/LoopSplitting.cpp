@@ -337,8 +337,8 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
                   auto branchinst = dyn_cast<BranchInst>(branchvalue);
                   branchinst->insertBefore(preheader->getTerminator());
                 }
-                auto *NewBI = BranchInst::Create(originPreheader,
-                                                 clonePreheader, branchvalue);
+                auto *NewBI = BranchInst::Create(clonePreheader,
+                                                 originPreheader, branchvalue);
                 NewBI->insertBefore(preheader->getTerminator());
                 preheader->getTerminator()->eraseFromParent();
               }

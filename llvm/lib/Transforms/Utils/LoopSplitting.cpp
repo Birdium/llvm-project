@@ -337,6 +337,7 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
                   auto branchinst = dyn_cast<BranchInst>(branchvalue);
                   branchinst->insertBefore(preheader->getTerminator());
                 }
+                branchvalue = llvm::ConstantInt::get(llvm::Type::getInt1Ty(F.getContext()), 1);
                 auto *NewBI = BranchInst::Create(clonePreheader,
                                                  originPreheader, branchvalue);
                 NewBI->insertBefore(preheader->getTerminator());

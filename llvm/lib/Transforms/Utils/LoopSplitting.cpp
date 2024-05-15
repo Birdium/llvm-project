@@ -120,7 +120,7 @@ getArrlen2CI(PHINode *PN, SmallPtrSet<Value *, 16> &bdchks, bool &doSplit) {
           arrlen2CI[arrlen].insert(CI);
         }
       } else {
-        doSplit = false;
+        // doSplit = false;
         break;
       }
     }

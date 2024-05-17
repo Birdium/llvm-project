@@ -1,14 +1,14 @@
 //===- llvm/include/llvm/Transforms/Utils/MyHello.h ----------*- C++ -*-===//
 
-#ifndef LLVM_TRANSFORMS_UTILS_LOOPSPLITTING_H
-#define LLVM_TRANSFORMS_UTILS_LOOPSPLITTING_H
+#ifndef LLVM_TRANSFORMS_UTILS_LOOPCHECKSELIMINATION_H
+#define LLVM_TRANSFORMS_UTILS_LOOPCHECKSELIMINATION_H
 
 #include "llvm/IR/Function.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Instructions.h"
 
 namespace llvm {
-class LoopSplittingPass : public PassInfoMixin<LoopSplittingPass> {
+class LoopChecksEliminationPass : public PassInfoMixin<LoopChecksEliminationPass> {
 private:
   SmallPtrSet<llvm::BasicBlock *, 16> panicBBs;
   SmallPtrSet<llvm::BranchInst *, 16> panicBranchInsts;

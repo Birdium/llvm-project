@@ -1,4 +1,4 @@
-#include "llvm/Transforms/Utils/LoopSplitting.h"
+#include "llvm/Transforms/Utils/LoopChecksElimination.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -17,7 +17,11 @@
 
 using namespace llvm;
 
-void LoopSplittingPass::initialization(Function *F) {
+void LoopChecksEliminationPass::initialization(Function *F) {
+  panicBBs = {};
+  panicBranchInsts = {};
+  bdchkInsts = {};
+  bdchkInstsInv = {};
   for (auto &BB : *F) {
     for (auto &I : BB) {
       // dbgs() << "Instruction: " << I << "\n";
@@ -103,33 +107,43 @@ findBdchkInstsInLoop(Loop *L, SmallPtrSet<Value *, 16> &BdchkInsts) {
 }
 
 static SmallDenseMap<Value *, SmallPtrSet<CmpInst *, 16>>
-getArrlen2CI(PHINode *PN, SmallPtrSet<Value *, 16> &bdchks, bool &doSplit) {
+getArrlen2CI(PHINode *PN, SmallPtrSet<Value *, 16> &bdchks, ScalarEvolution *SE,
+             bool &doSplit) {
   SmallDenseMap<Value *, SmallPtrSet<CmpInst *, 16>> arrlen2CI;
   for (auto *I : bdchks) {
     if (auto *CI = dyn_cast<CmpInst>(I)) {
       if (CI->getOperand(0) == PN) {
-        dbgs() << CI->getPredicate() << "\n";
+        // dbgs() << CI->getPredicate() << "\n";
         if (CI->getPredicate() != CmpInst::ICMP_NE) {
           auto *arrlen = CI->getOperand(1);
           arrlen2CI[arrlen].insert(CI);
         }
       } else if (CI->getOperand(1) == PN) {
-        dbgs() << CI->getPredicate() << "\n";
+        // dbgs() << CI->getPredicate() << "\n";
         if (CI->getPredicate() != CmpInst::ICMP_NE) {
           auto *arrlen = CI->getOperand(0);
           arrlen2CI[arrlen].insert(CI);
         }
       } else {
         // doSplit = false;
-        break;
+        auto op0 = CI->getOperand(0);
+        auto op1 = CI->getOperand(1);
+        auto scev0 = SE->getSCEV(op0);
+        auto scev1 = SE->getSCEV(op1);
+        dbgs() << "CI: " << *CI << "\n";
+        dbgs() << *scev0 << "   " << *scev1 << "\n";
+        auto *arrlen = CI->getOperand(1);
+        arrlen2CI[arrlen].insert(CI);
+
+        // break;
       }
     }
   }
   return arrlen2CI;
 }
 
-PreservedAnalyses LoopSplittingPass::run(Function &F,
-                                         FunctionAnalysisManager &AM) {
+PreservedAnalyses LoopChecksEliminationPass::run(Function &F,
+                                                 FunctionAnalysisManager &AM) {
   LoopInfo *LI = &AM.getResult<LoopAnalysis>(F);
   DominatorTree *DT = &AM.getResult<DominatorTreeAnalysis>(F);
   auto *LAIs = &AM.getResult<LoopAccessAnalysis>(F);
@@ -205,9 +219,14 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
 
         dbgs() << "Loop max trip count: " << *loopMaxTripCount << "\n";
 
+        if (dyn_cast<SCEVCouldNotCompute>(loopMaxTripCount)) {
+          dbgs() << "Could not compute loop max trip count\n";
+          continue;
+        }
+
         bool doSplit = bdchks.size() > 0;
 
-        auto arrlen2CI = getArrlen2CI(PN, bdchks, doSplit);
+        auto arrlen2CI = getArrlen2CI(PN, bdchks, SE, doSplit);
 
         if (doSplit) {
           bool doEliminate = arrlen2CI.size() > 0;
@@ -227,11 +246,13 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
               }
               auto *indexSCEV = SE->getSCEV(index);
               dbgs() << "Index: " << *indexSCEV << "\n";
+              dbgs() << "arrlenSCEV: " << *arrlenSCEV << "\n";
               const SCEV *diff = SE->getMinusSCEV(arrlenSCEV, loopMaxTripCount);
               dbgs() << "Difference: " << *diff << "\n";
               bool isAlwaysInbound =
-                  isCITrueWhenEQ ? isKnownNonNegativeInLoop(diff, L, *SE)
-                                 : isKnownPositiveInLoop(diff, L, *SE);
+                  // isCITrueWhenEQ ?
+                  isKnownNonNegativeInLoop(diff, L, *SE);
+              //  : isKnownPositiveInLoop(diff, L, *SE);
               if (!isAlwaysInbound) {
                 dbgs() << "Index may out of bound: " << *CI << "\n";
                 doEliminate = false;
@@ -245,103 +266,37 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
                       auto succ1 = BI->getSuccessor(1);
                       BasicBlock *target =
                           panicBBs.count(succ0) ? succ1 : succ0;
+                      BasicBlock *panicBB =
+                          panicBBs.count(succ0) ? succ0 : succ1;
+                      auto BB = CI->getParent();
+                      for (auto &I : *panicBB) {
+                        if (llvm::PHINode *phi =
+                                llvm::dyn_cast<llvm::PHINode>(&I)) {
+                          // Now `phi` is a PHI node.
+                          dbgs() << "phi " << *phi << "\n";
+                          dbgs() << "bb " << *BB << "\n";
+                          auto idx = phi->getBasicBlockIndex(BB);
+                          if (idx != -1) {
+                            if (phi->getNumIncomingValues() > 1) {
+                              phi->removeIncomingValue(BB);
+                            } else {
+                              panicBB->eraseFromParent();
+                              break;
+                            }
+                          }
+                        } else {
+                          // We've reached a non-PHI instruction, so we break
+                          // out of the loop.
+                          break;
+                        }
+                      }
                       BranchInst *NewBI = BranchInst::Create(target);
                       NewBI->insertAfter(I);
                       I->eraseFromParent();
-                      LI;
                       changed = true;
                     }
                   }
                 }
-              }
-            }
-          }
-          if (!mayOutCmps.empty()) {
-            if (L->isInnermost()) {
-              dbgs() << "Do Promotion\n";
-              ValueToValueMapTy VMap;
-              SmallVector<llvm::BasicBlock *, 8> NewLoopBlocks;
-              if (L->getLoopPreheader()) {
-                auto preheader = L->getLoopPreheader();
-                auto originPreheader =
-                    SplitEdge(preheader, L->getHeader(), DT, LI);
-                llvm::Loop *NewLoop = llvm::cloneLoopWithPreheader(
-                    L->getLoopPreheader(), L->getLoopPreheader(), L, VMap,
-                    ".clone", LI, DT, NewLoopBlocks);
-                remapInstructionsInBlocks(NewLoopBlocks, VMap);
-                auto clonePreheader = NewLoop->getLoopPreheader();
-                SmallDenseMap<BranchInst *, BranchInst *> BranchReplacements;
-                for (auto *BB : NewLoop->getBlocks()) {
-                  for (auto &I : *BB) {
-                    if (auto *BI = dyn_cast<BranchInst>(&I)) {
-                      if (BI->getNumSuccessors() == 2) {
-                        auto succ0 = BI->getSuccessor(0);
-                        auto succ1 = BI->getSuccessor(1);
-                        BasicBlock *target = nullptr;
-                        if (panicBBs.count(succ0)) {
-                          target = succ1;
-                        } else if (panicBBs.count(succ1)) {
-                          target = succ0;
-                        }
-                        if (target != nullptr) {
-                          BranchInst *NewBI = BranchInst::Create(target);
-                          BranchReplacements[BI] = NewBI;
-                        }
-                      }
-                    }
-                  }
-                }
-                for (auto &[BI, NewBI] : BranchReplacements) {
-                  NewBI->insertAfter(BI);
-                  BI->eraseFromParent();
-                }
-                dbgs() << "NewLoopBlocks count: " << NewLoopBlocks.size() << "\n";
-                for (auto *BB : NewLoop->getBlocks()) {
-                  dbgs() << "NewLoopBlock: " << *BB << "\n";
-                }
-                SmallVector<Value *, 16> cmpvalues;
-                for (auto CI : mayOutCmps) {
-                  auto op0 = CI->getOperand(0);
-                  auto op1 = CI->getOperand(1);
-                  auto scev0 = SE->getSCEV(op0);
-                  auto scev1 = SE->getSCEV(op1);
-                  dbgs() << "CI: " << *CI << "\n";
-                  dbgs() << "op0: " << *op0 << "\n";
-                  dbgs() << "op1: " << *op1 << "\n";
-                  auto scev_idx = arrlen2CI.count(op0) ? scev1 : scev0;
-                  auto scev_len = arrlen2CI.count(op0) ? scev0 : scev1;
-                  auto scev_idx_max =
-                      SE->getSCEVAtScope(scev_idx, L->getParentLoop());
-
-                  dbgs() << "scev_idx: " << *scev_idx << "\n";
-                  dbgs() << "scev_len: " << *scev_len << "\n";
-                  dbgs() << "scev_idx_max: " << *scev_idx_max << "\n";
-
-                  llvm::SCEVExpander Expander(
-                      *SE, F.getParent()->getDataLayout(), "scevexpander");
-                  auto val_idx = Expander.expandCodeFor(
-                      scev_idx_max, nullptr, preheader->getTerminator());
-                  auto val_len = Expander.expandCodeFor(
-                      scev_len, nullptr, preheader->getTerminator());
-                  auto bdchk = ICmpInst::Create(
-                      Instruction::ICmp, ICmpInst::ICMP_ULT, val_idx, val_len);
-                  bdchk->insertBefore(preheader->getTerminator());
-                  cmpvalues.push_back(bdchk);
-                }
-                Value *branchvalue = nullptr;
-                if (!cmpvalues.empty())
-                  branchvalue = cmpvalues[0];
-                for (int i = 1; i < cmpvalues.size(); i++) {
-                  branchvalue =
-                      BinaryOperator::CreateAnd(branchvalue, cmpvalues[i]);
-                  auto branchinst = dyn_cast<BranchInst>(branchvalue);
-                  branchinst->insertBefore(preheader->getTerminator());
-                }
-                branchvalue = llvm::ConstantInt::get(llvm::Type::getInt1Ty(F.getContext()), 1);
-                auto *NewBI = BranchInst::Create(clonePreheader,
-                                                 originPreheader, branchvalue);
-                NewBI->insertBefore(preheader->getTerminator());
-                preheader->getTerminator()->eraseFromParent();
               }
             }
           }
@@ -376,6 +331,19 @@ PreservedAnalyses LoopSplittingPass::run(Function &F,
   // TODO: Clone the loop and modify the bounds to [0, 100) and [100, m).
 
   // TODO: Add the cloned loops to the new basic block.
+
+  // for (auto *panicBB : panicBBs) {
+  //   dbgs() << "panic BB: " << panicBB->getName() << "\n";
+  //   for (llvm::pred_iterator PI = llvm::pred_begin(panicBB),
+  //                            E = llvm::pred_end(panicBB);
+  //        PI != E; ++PI) {
+  //     llvm::BasicBlock *Pred = *PI;
+  //     dbgs() << "PredBB: " << Pred->getName() << "\n";
+  //   }
+  //   // Now `Pred` is a predecessor of `BB`.
+  // }
+
+  // dbgs() << F << "\n";
 
   dbgs() << "\n";
   if (changed) {
